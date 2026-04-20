@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Next.js
+.next/
+out/
+
+# Python
+*.so
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+postgres_data/
+
+# FAISS index (regenerate with build_faiss_index.py)
+backend/data/faiss_index/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+.agent/
+.github/
+openspec/
+docker-compose.dev.yml
