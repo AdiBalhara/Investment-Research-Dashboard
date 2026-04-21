@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ird_user}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ird_user} -d ${POSTGRES_DB:-ird_db}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -38,11 +38,9 @@ services:
         condition: service_healthy
 
   frontend:
-    image: adibalhara/ird-frontend:v1.0.0
+    image: adibalhara/ird-frontend:v1.0.2
     container_name: ird-frontend
     restart: unless-stopped
-    environment:
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost/api}
     expose:
       - "3000"
     depends_on:
