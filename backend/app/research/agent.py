@@ -564,10 +564,10 @@ def _validate_research_result(data: dict, tool_outputs: dict[str, list]) -> bool
 
 def create_agent():
     llm = ChatGroq(
-        model="llama-3.1-8b-instant",
+        model="llama-3.3-70b-versatile",
         api_key=settings.GROQ_API_KEY,
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=1500,
     )
 
     tools = [get_stock_data, search_news, search_financial_documents]
