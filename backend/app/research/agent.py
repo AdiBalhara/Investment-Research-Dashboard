@@ -1,4 +1,6 @@
+import asyncio
 import json
+import re
 import time
 import logging
 from typing import Any
@@ -7,6 +9,8 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents import create_json_chat_agent, AgentExecutor
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.agents import AgentAction
 
 from app.config import get_settings
 from app.research.tools.stock_data import get_stock_data
@@ -78,6 +82,24 @@ USER'S INPUT
 --------------------
 {input}
 """
+
+
+class _StepCapture(BaseCallbackHandler):
+    """Captures (action, observation) pairs as the agent runs, so partial results
+    are available even when the agent raises an exception mid-run."""
+
+    def __init__(self):
+        super().__init__()
+        self._pending_action: AgentAction | None = None
+        self.intermediate_steps: list[tuple[AgentAction, str]] = []
+
+    def on_agent_action(self, action: AgentAction, **kwargs) -> None:
+        self._pending_action = action
+
+    def on_tool_end(self, output: str, **kwargs) -> None:
+        if self._pending_action is not None:
+            self.intermediate_steps.append((self._pending_action, output))
+            self._pending_action = None
 
 
 def _try_parse_json(text: str):
@@ -360,6 +382,7 @@ def _filter_valid_sections(data: dict, tool_outputs: dict[str, list]) -> dict:
         # Normalize news_sentiment: enrich items with summary/url from tool output
         if section_type == "news_sentiment":
             articles_map = _get_news_articles_map(tool_outputs)
+            known_titles = _get_news_titles(tool_outputs)
             raw_items = section_data.get("data", [])
             if isinstance(raw_items, list):
                 normalized_items = []
@@ -367,6 +390,10 @@ def _filter_valid_sections(data: dict, tool_outputs: dict[str, list]) -> dict:
                     if not isinstance(item, dict):
                         continue
                     title = item.get("title", "")
+                    # Only keep items whose titles came from the tool to prevent validation failure
+                    if known_titles and title not in known_titles:
+                        logger.debug(f"Dropping news item with unmatched title: {title!r}")
+                        continue
                     tool_article = articles_map.get(title, {})
                     normalized_items.append({
                         "title": title,
@@ -375,6 +402,9 @@ def _filter_valid_sections(data: dict, tool_outputs: dict[str, list]) -> dict:
                         "summary": item.get("summary") or tool_article.get("description", "") or "",
                         "url": item.get("url") or tool_article.get("url", ""),
                     })
+                if not normalized_items:
+                    logger.debug("Skipping news_sentiment section: no items matched tool output titles")
+                    continue
                 section_data = dict(section_data, data=normalized_items)
 
         # Skip financial_comparison if no company data
@@ -517,12 +547,13 @@ def _validate_section(section: ResearchSection, tool_outputs: dict[str, list]) -
     if section.type == "news_sentiment":
         if not isinstance(data, list) or len(data) == 0:
             return False
+        titles = _get_news_titles(tool_outputs)
         for item in data:
             if not isinstance(item, dict):
                 return False
             if not all(field in item for field in ("title", "source", "sentiment")):
                 return False
-            if item.get("title") not in titles:
+            if titles and item.get("title") not in titles:
                 return False
 
         return True
@@ -631,8 +662,26 @@ def parse_agent_response(output: str, intermediate_steps: list, query: str) -> R
             data = _filter_valid_sections(data, tool_outputs)
 
             if not _validate_research_result(data, tool_outputs):
-                logger.warning("Agent output failed validation against tool output and schema.")
-                raise ValueError("Structured output failed validation")
+                logger.warning("Agent output failed validation against tool output and schema — filtering to valid sections.")
+                valid_section_dicts = []
+                for section_data in data.get("sections", []):
+                    if not isinstance(section_data, dict):
+                        continue
+                    section_obj = ResearchSection(
+                        type=section_data.get("type", ""),
+                        render_as=section_data.get("render_as", ""),
+                        title=section_data.get("title", ""),
+                        data=section_data.get("data", {}),
+                        source=section_data.get("source"),
+                        explanation=section_data.get("explanation", ""),
+                    )
+                    if _validate_section(section_obj, tool_outputs):
+                        valid_section_dicts.append(section_data)
+                    else:
+                        logger.warning(f"Dropping invalid section: type={section_data.get('type')} render_as={section_data.get('render_as')}")
+                data["sections"] = valid_section_dicts
+                if not valid_section_dicts:
+                    raise ValueError("Structured output failed validation — no valid sections remain")
 
             sections = []
             for section_data in data.get("sections", []):
@@ -674,7 +723,7 @@ def parse_agent_response(output: str, intermediate_steps: list, query: str) -> R
             )
 
     except Exception as e:
-        logger.warning(f"Failed to parse agent response: {e}")
+        logger.warning(f"Failed to parse agent response: {e}", exc_info=True)
         tool_outputs = _extract_tool_outputs(intermediate_steps)
         fallback_content = _build_fallback_response(output, tool_outputs)
         
@@ -700,9 +749,10 @@ async def run_research(query: str) -> ResearchResult:
     """Run the AI research agent on a user query."""
     start_time = time.time()
 
+    step_capture = _StepCapture()
     try:
         agent = create_agent()
-        result = await agent.ainvoke({"input": query})
+        result = await agent.ainvoke({"input": query}, config={"callbacks": [step_capture]})
 
         output = result.get("output", "")
         intermediate_steps = result.get("intermediate_steps", [])
@@ -725,6 +775,17 @@ async def run_research(query: str) -> ResearchResult:
     except Exception as e:
         logger.error(f"Research agent failed: {e}", exc_info=True)
         total_time = int((time.time() - start_time) * 1000)
+        # If we captured tool outputs before the exception, show partial results
+        if step_capture.intermediate_steps:
+            logger.info("Exception mid-run but partial tool data available — building partial result")
+            partial = parse_agent_response("", step_capture.intermediate_steps, query)
+            partial.sections.insert(0, ResearchSection(
+                type="summary", render_as="text",
+                title="Partial Results",
+                data={"content": "Note: AI analysis could not be completed. Showing available market data."},
+                source="system", explanation="Agent error — partial data shown",
+            ))
+            return partial
         return ResearchResult(
             query=query,
             confidence=0.2,
@@ -734,6 +795,8 @@ async def run_research(query: str) -> ResearchResult:
                     render_as="text",
                     title="Error",
                     data={"content": f"An error occurred while processing your query: {str(e)}. Please try again."},
+                    source="system",
+                    explanation="Agent error",
                 )
             ],
             execution_steps=[ExecutionStep(tool="agent", input=query, duration_ms=total_time, status="error")],
